@@ -165,7 +165,11 @@ int main(int argc, char* argv[])
     std::printf("[MAIN] fakeBase initialized: fake_client_seq=%u fake_proxy_seq=%u\n",
                 fake_base.fake_client_seq,
                 fake_base.fake_proxy_seq);
-
+if(nfqueue_rule_installed)
+{
+    cleanup_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
+    nfqueue_rule_installed = false;
+}
     /*
      * 5. tunC 생성/설정
      *

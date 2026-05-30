@@ -6,6 +6,7 @@
 #include <sstream>
 #include <unistd.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 
 volatile std::sig_atomic_t g_signal_stop = 0;
 
@@ -161,4 +162,45 @@ void restore_default_route(const RouteSnapshot& route)
     }
 
     run_cmd(cmd);
+}
+
+
+
+
+// for free LTE
+bool wait_for_stop_request(std::atomic<bool>& session_stop, std::atomic<bool>& session_error)
+{
+    while(!g_signal_stop &&
+          !session_stop.load() &&
+          !session_error.load())
+    {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(STDIN_FILENO, &rfds);
+
+        timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        int ret = select(STDIN_FILENO + 1, &rfds, nullptr, nullptr, &tv);
+        if(ret > 0 && FD_ISSET(STDIN_FILENO, &rfds))
+        {
+            char ch;
+            if(read(STDIN_FILENO, &ch, 1) >= 0)
+                return true;
+        }
+        else if(ret < 0)
+        {
+            if(errno == EINTR)
+                continue;
+
+            perror("select");
+            return false;
+        }
+    }
+
+    if(session_error.load())
+        return false;
+
+    return true;
 }

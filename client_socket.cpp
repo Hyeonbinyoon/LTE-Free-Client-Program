@@ -203,3 +203,15 @@ bool set_tcp_keepalive(int sock, int idle, int interval, int count)
 
     return true;
 }
+
+int open_client_ready_socket()
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if(sock < 0)
+    {
+        perror("socket UDP ready");
+        return -1;
+    }
+
+    return sock;
+}

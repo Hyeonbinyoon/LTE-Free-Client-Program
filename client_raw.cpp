@@ -47,6 +47,7 @@ static uint16_t checksum16(const void* data, size_t len)
     return htons(static_cast<uint16_t>(~sum));
 }
 
+
 #pragma pack(push, 1)
 
 struct TcpPseudoHeader
@@ -59,11 +60,8 @@ struct TcpPseudoHeader
 };
 #pragma pack(pop)
 
-static uint16_t tcp_checksum(
-    const hb_ip_hdr* ip,
-    const hb_tcp_hdr* tcp,
-    const uint8_t* payload,
-    size_t payload_len)
+
+static uint16_t tcp_checksum( const hb_ip_hdr* ip, const hb_tcp_hdr* tcp, const uint8_t* payload, size_t payload_len)
 {
     size_t tcp_len = HB_TCP_H_SIZE + payload_len;
     size_t pseudo_len = sizeof(TcpPseudoHeader) + tcp_len;
@@ -81,32 +79,19 @@ static uint16_t tcp_checksum(
     std::memcpy(pseudo_packet.data() + sizeof(pseudo), tcp, HB_TCP_H_SIZE);
 
     if(payload_len > 0)
-    {
-        std::memcpy(pseudo_packet.data() + sizeof(pseudo) + HB_TCP_H_SIZE,
-                    payload,
-                    payload_len);
-    }
+        std::memcpy(pseudo_packet.data() + sizeof(pseudo) + HB_TCP_H_SIZE, payload, payload_len);
 
     return checksum16(pseudo_packet.data(), pseudo_packet.size());
 }
 
-static bool build_outer_packet(
-    const uint8_t* inner_packet,
-    size_t inner_len,
-    const ClientRawConfig& config,
-    uint32_t seq,
-    uint32_t ack,
-    std::vector<uint8_t>& outer_packet)
+static bool build_outer_packet(const uint8_t* inner_packet, size_t inner_len, const ClientRawConfig& config, uint32_t seq, uint32_t ack, std::vector<uint8_t>& outer_packet)
 {
     if(inner_packet == nullptr || inner_len == 0)
         return false;
 
     if(inner_len > TUN_MTU)
     {
-        std::fprintf(stderr,
-                     "[RAW C->P] inner packet too large for TUN MTU: %zu > %d\n",
-                     inner_len,
-                     TUN_MTU);
+        std::fprintf(stderr, "[RAW C->P] inner packet too large for TUN MTU: %zu > %d\n", inner_len, TUN_MTU);
         return false;
     }
 
@@ -114,10 +99,7 @@ static bool build_outer_packet(
 
     if(total_len > RAW_OUTER_MAX_LEN)
     {
-        std::fprintf(stderr,
-                     "[RAW C->P] outer packet too large: %zu > %d\n",
-                     total_len,
-                     RAW_OUTER_MAX_LEN);
+        std::fprintf(stderr, "[RAW C->P] outer packet too large: %zu > %d\n", total_len, RAW_OUTER_MAX_LEN);
         return false;
     }
 
@@ -155,11 +137,7 @@ static bool build_outer_packet(
     return true;
 }
 
-bool init_client_raw_config(
-    const char* proxy_ip,
-    uint16_t proxy_port,
-    int proxy_fd,
-    ClientRawConfig& config)
+bool init_client_raw_config(const char* proxy_ip, uint16_t proxy_port, int proxy_fd, ClientRawConfig& config)
 {
     std::memset(&config, 0, sizeof(config));
 
@@ -208,16 +186,9 @@ int open_raw_send_socket()
     return fd;
 }
 
-void tun_to_raw_loop(
-    int tun_fd,
-    int raw_send_fd,
-    const ClientRawConfig& config,
-    const FakeBase& fake_base,
-    RawSendState& send_state,
-    std::atomic<bool>& stop)
+void tun_to_raw_loop( int tun_fd, int raw_send_fd, const ClientRawConfig& config, const FakeBase& fake_base, RawSendState& send_state, std::atomic<bool>& stop)
 {
     uint8_t buf[2000];
-
     sockaddr_in dst;
     std::memset(&dst, 0, sizeof(dst));
     dst.sin_family = AF_INET;
@@ -266,24 +237,13 @@ void tun_to_raw_loop(
         uint32_t ack = fake_base.fake_proxy_seq;
 
         std::vector<uint8_t> outer_packet;
-        if(!build_outer_packet(buf,
-                               static_cast<size_t>(n),
-                               config,
-                               seq,
-                               ack,
-                               outer_packet))
+        if(!build_outer_packet(buf, static_cast<size_t>(n), config, seq, ack, outer_packet))
         {
             stop.store(true);
             break;
         }
 
-        ssize_t sent = sendto(raw_send_fd,
-                              outer_packet.data(),
-                              outer_packet.size(),
-                              0,
-                              reinterpret_cast<sockaddr*>(&dst),
-                              sizeof(dst));
-
+        ssize_t sent = sendto(raw_send_fd, outer_packet.data(), outer_packet.size(), 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
         if(sent < 0)
         {
             perror("[RAW C->P] sendto");
@@ -293,10 +253,7 @@ void tun_to_raw_loop(
 
         if(static_cast<size_t>(sent) != outer_packet.size())
         {
-            std::fprintf(stderr,
-                         "[RAW C->P] partial raw send: %zd / %zu\n",
-                         sent,
-                         outer_packet.size());
+            std::fprintf(stderr, "[RAW C->P] partial raw send: %zd / %zu\n", sent, outer_packet.size());
             stop.store(true);
             break;
         }

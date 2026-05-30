@@ -1,16 +1,4 @@
 // for free LTE
-/* 1. TCP connect 완료
-   2. get_socket_local_tuple()으로 Client local IP/port 확보
-   3. install_client_nfqueue_rule()
-   4. learn_client_tcp_base_with_nfqueue()
-    4-1. Proxy → Client keepalive ACK 대기
-    4-2. packet 수신
-    4-3. seq/ack 추출
-    4-4. realBase = C/P 저장
-    4-5. fakeBase = C+1/P+1 저장
-    4-6. 해당 packet NF_ACCEPT
-   5. learning 성공 후 tunC 생성/설정 단계로 이동 */
-
 #include "client.h"
 #include "hb_headers.h"
 
@@ -44,7 +32,14 @@ struct ClientNfqueueContext
     const ClientRawConfig* config = nullptr;
     RealBase* real_base = nullptr;
     FakeBase* fake_base = nullptr;
+    ClientKeepaliveAckFingerprint* keepalive_ack = nullptr;
     bool learned = false;
+};
+
+struct ClientTunnelNfqueueContext
+{
+    const ClientRawConfig* config = nullptr;
+    ClientTunnelState* tunnel_state = nullptr;
 };
 
 static uint32_t get_packet_id(nfq_data* nfad)
@@ -67,11 +62,7 @@ static bool ip_to_string(uint32_t ip_net, std::string& out)
     return true;
 }
 
-static bool parse_proxy_to_client_tcp_packet(
-    const uint8_t* packet,
-    size_t packet_len,
-    const ClientRawConfig& config,
-    ParsedOuterTcpPacket& parsed)
+static bool parse_proxy_to_client_tcp_packet(const uint8_t* packet, size_t packet_len, const ClientRawConfig& config, ParsedOuterTcpPacket& parsed)
 {
     if(packet == nullptr)
         return false;
@@ -143,26 +134,13 @@ static bool is_client_learning_keepalive_ack(const ParsedOuterTcpPacket& parsed)
     if(parsed.payload_len != 0)
         return false;
 
-    if((parsed.tcp->flags & TCP_FLAG_ACK) == 0)
-        return false;
-
-    if((parsed.tcp->flags & TCP_FLAG_SYN) != 0)
-        return false;
-
-    if((parsed.tcp->flags & TCP_FLAG_FIN) != 0)
-        return false;
-
-    if((parsed.tcp->flags & TCP_FLAG_RST) != 0)
+    if(parsed.tcp->flags != TCP_FLAG_ACK)
         return false;
 
     return true;
 }
 
-static int client_learning_callback(
-    nfq_q_handle* qh,
-    nfgenmsg*,
-    nfq_data* nfad,
-    void* data)
+static int client_learning_callback(nfq_q_handle* qh, nfgenmsg*, nfq_data* nfad, void* data)
 {
     ClientNfqueueContext* ctx = reinterpret_cast<ClientNfqueueContext*>(data);
     uint32_t packet_id = get_packet_id(nfad);
@@ -173,27 +151,22 @@ static int client_learning_callback(
     if(payload_len < 0)
     {
         std::fprintf(stderr, "[NFQ C-LEARN] failed to get payload\n");
-        return nfq_set_verdict(qh, packet_id, NF_ACCEPT, 0, nullptr);
+        return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
     }
 
     ParsedOuterTcpPacket parsed;
-    if(!parse_proxy_to_client_tcp_packet(raw_payload,
-                                         static_cast<size_t>(payload_len),
-                                         *ctx->config,
-                                         parsed))
+    if(!parse_proxy_to_client_tcp_packet(raw_payload, static_cast<size_t>(payload_len), *ctx->config, parsed))
     {
-        return nfq_set_verdict(qh, packet_id, NF_ACCEPT, 0, nullptr);
+        std::fprintf(stderr, "[NFQ C-LEARN] drop unparsed packet\n");
+        return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
     }
 
-    std::printf("[NFQ C-LEARN] tcp packet seq=%u ack=%u flags=0x%02x payload_len=%zu\n",
-                parsed.seq,
-                parsed.ack,
-                parsed.tcp->flags,
-                parsed.payload_len);
+    std::printf("[NFQ C-LEARN] tcp packet seq=%u ack=%u flags=0x%02x payload_len=%zu\n", parsed.seq, parsed.ack, parsed.tcp->flags, parsed.payload_len);
 
     if(!is_client_learning_keepalive_ack(parsed))
     {
-        return nfq_set_verdict(qh, packet_id, NF_ACCEPT, 0, nullptr);
+        std::fprintf(stderr, "[NFQ C-LEARN] drop non-keepalive packet flags=0x%02x payload_len=%zu\n", parsed.tcp->flags, parsed.payload_len);
+        return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
     }
 
     ctx->real_base->client_seq = parsed.ack - 1;
@@ -204,18 +177,163 @@ static int client_learning_callback(
     ctx->fake_base->fake_proxy_seq = ctx->real_base->proxy_seq + 1;
     ctx->fake_base->initialized = true;
 
+    if(ctx->keepalive_ack != nullptr)
+    {
+        ctx->keepalive_ack->ip_src = parsed.ip->src_ip;
+        ctx->keepalive_ack->ip_dst = parsed.ip->dst_ip;
+        ctx->keepalive_ack->tcp_src = parsed.tcp->src_port_value();
+        ctx->keepalive_ack->tcp_dst = parsed.tcp->dst_port_value();
+        ctx->keepalive_ack->seq = parsed.seq;
+        ctx->keepalive_ack->ack = parsed.ack;
+        ctx->keepalive_ack->flags = parsed.tcp->flags;
+        ctx->keepalive_ack->learned = true;
+    }
+
     ctx->learned = true;
 
-    std::printf("[NFQ C-LEARN] learned realBase: client_seq=%u proxy_seq=%u\n",
-                ctx->real_base->client_seq,
-                ctx->real_base->proxy_seq);
-
-    std::printf("[NFQ C-LEARN] initialized fakeBase: fake_client_seq=%u fake_proxy_seq=%u\n",
-                ctx->fake_base->fake_client_seq,
-                ctx->fake_base->fake_proxy_seq);
+    std::printf("[NFQ C-LEARN] learned realBase: client_seq=%u proxy_seq=%u\n", ctx->real_base->client_seq, ctx->real_base->proxy_seq);
+    std::printf("[NFQ C-LEARN] initialized fakeBase: fake_client_seq=%u fake_proxy_seq=%u\n", ctx->fake_base->fake_client_seq, ctx->fake_base->fake_proxy_seq);
 
     return nfq_set_verdict(qh, packet_id, NF_ACCEPT, 0, nullptr);
 }
+
+
+static bool is_client_learned_keepalive_ack(const ParsedOuterTcpPacket& parsed, const ClientKeepaliveAckFingerprint& learned)
+{
+    if(!learned.learned)
+        return false;
+
+    if(parsed.ip == nullptr || parsed.tcp == nullptr)
+        return false;
+
+    if(parsed.payload_len != 0)
+        return false;
+
+    if(parsed.ip->src_ip != learned.ip_src)
+        return false;
+
+    if(parsed.ip->dst_ip != learned.ip_dst)
+        return false;
+
+    if(parsed.tcp->src_port_value() != learned.tcp_src)
+        return false;
+
+    if(parsed.tcp->dst_port_value() != learned.tcp_dst)
+        return false;
+
+    if(parsed.seq != learned.seq)
+        return false;
+
+    if(parsed.ack != learned.ack)
+        return false;
+
+    if(parsed.tcp->flags != learned.flags)
+        return false;
+
+    return true;
+}
+
+static bool extract_inner_ipv4_packet(const uint8_t* payload, size_t payload_len, std::vector<uint8_t>& inner_packet)
+{
+    if(payload == nullptr)
+        return false;
+
+    if(payload_len < HB_IPV4_H_SIZE)
+        return false;
+
+    const hb_ip_hdr* inner_ip = reinterpret_cast<const hb_ip_hdr*>(payload);
+
+    if(inner_ip->version() != IP_VERSION_IPv4)
+        return false;
+
+    size_t inner_ip_header_len = inner_ip->header_len();
+    if(inner_ip_header_len < HB_IPV4_H_SIZE)
+        return false;
+
+    if(payload_len < inner_ip_header_len)
+        return false;
+
+    uint16_t inner_total_len = inner_ip->total_length();
+    if(inner_total_len < inner_ip_header_len)
+        return false;
+
+    if(inner_total_len != payload_len)
+        return false;
+
+    if(inner_total_len > TUN_MTU)
+        return false;
+
+    inner_packet.assign(payload, payload + inner_total_len);
+    return true;
+}
+
+static int client_tunnel_callback(nfq_q_handle* qh, nfgenmsg*, nfq_data* nfad, void* data)
+{
+    ClientTunnelNfqueueContext* ctx = reinterpret_cast<ClientTunnelNfqueueContext*>(data);
+    uint32_t packet_id = get_packet_id(nfad);
+
+    unsigned char* raw_payload = nullptr;
+    int payload_len = nfq_get_payload(nfad, &raw_payload);
+
+    if(payload_len < 0)
+    {
+        std::fprintf(stderr, "[NFQ C-TUNNEL] failed to get payload\n");
+        return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
+    }
+
+    ParsedOuterTcpPacket parsed;
+    if(!parse_proxy_to_client_tcp_packet(raw_payload, static_cast<size_t>(payload_len), *ctx->config, parsed))
+    {
+        std::fprintf(stderr, "[NFQ C-TUNNEL] drop unparsed packet\n");
+        return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
+    }
+
+    if(parsed.payload_len == 0)
+    {
+        if(is_client_learned_keepalive_ack(parsed, ctx->tunnel_state->keepalive_ack))
+        {
+            return nfq_set_verdict(qh, packet_id, NF_ACCEPT, 0, nullptr);
+        }
+
+        std::fprintf(stderr, "[NFQ C-TUNNEL] drop non-learned ACK seq=%u ack=%u flags=0x%02x\n", parsed.seq, parsed.ack, parsed.tcp->flags);
+        return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
+    }
+
+    if(!ctx->tunnel_state->data_plane_ready.load())
+    {
+        std::fprintf(stderr, "[NFQ C-TUNNEL] drop payload before data plane ready payload_len=%zu\n", parsed.payload_len);
+        return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
+    }
+
+    std::vector<uint8_t> inner_packet;
+    if(!extract_inner_ipv4_packet(parsed.payload, parsed.payload_len, inner_packet))
+    {
+        std::fprintf(stderr, "[NFQ C-TUNNEL] drop invalid inner IPv4 payload_len=%zu\n", parsed.payload_len);
+        return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
+    }
+
+    int tun_fd = ctx->tunnel_state->tun_fd.load();
+    if(tun_fd < 0)
+    {
+        std::fprintf(stderr, "[NFQ C-TUNNEL] tun fd is not ready\n");
+        return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
+    }
+
+    if(!write_packet_to_tun(tun_fd, inner_packet))
+    {
+        std::fprintf(stderr, "[NFQ C-TUNNEL] failed to write inner packet to tun\n");
+        ctx->tunnel_state->session_error.store(true);
+        return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
+    }
+
+    std::printf("[NFQ C-TUNNEL] wrote inner IPv4 packet to tun len=%zu\n", inner_packet.size());
+    return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
+}
+
+
+
+
+
 
 bool install_client_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_num)
 {
@@ -270,12 +388,7 @@ void cleanup_client_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_n
     run_cmd(cmd);
 }
 
-bool learn_client_tcp_base_with_nfqueue(
-    uint16_t queue_num,
-    const ClientRawConfig& config,
-    RealBase& real_base,
-    FakeBase& fake_base,
-    std::atomic<bool>& stop)
+bool learn_client_tcp_base_with_nfqueue( uint16_t queue_num, const ClientRawConfig& config, RealBase& real_base, FakeBase& fake_base, ClientKeepaliveAckFingerprint& keepalive_ack, std::atomic<bool>& stop)
 {
     nfq_handle* h = nfq_open();
     if(h == nullptr)
@@ -298,16 +411,16 @@ bool learn_client_tcp_base_with_nfqueue(
         return false;
     }
 
+    keepalive_ack = ClientKeepaliveAckFingerprint();
+
     ClientNfqueueContext ctx;
     ctx.config = &config;
     ctx.real_base = &real_base;
     ctx.fake_base = &fake_base;
+    ctx.keepalive_ack = &keepalive_ack;
     ctx.learned = false;
 
-    nfq_q_handle* qh = nfq_create_queue(h,
-                                        queue_num,
-                                        &client_learning_callback,
-                                        &ctx);
+    nfq_q_handle* qh = nfq_create_queue(h, queue_num, &client_learning_callback, &ctx);
     if(qh == nullptr)
     {
         std::fprintf(stderr, "nfq_create_queue failed\n");
@@ -368,11 +481,130 @@ bool learn_client_tcp_base_with_nfqueue(
     nfq_destroy_queue(qh);
     nfq_close(h);
 
-    if(!ctx.learned)
+    if(!ctx.learned || !keepalive_ack.learned)
     {
         std::fprintf(stderr, "[NFQ C-LEARN] learning failed or stopped\n");
         return false;
     }
 
     return true;
+}
+
+
+
+
+bool install_client_tunnel_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_num)
+{
+    return install_client_nfqueue_rule(config, queue_num);
+}
+
+void cleanup_client_tunnel_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_num)
+{
+    cleanup_client_nfqueue_rule(config, queue_num);
+}
+
+void client_tunnel_nfqueue_loop(uint16_t queue_num, const ClientRawConfig& config, ClientTunnelState& tunnel_state, std::atomic<bool>& stop)
+{
+    nfq_handle* h = nfq_open();
+    if(h == nullptr)
+    {
+        std::fprintf(stderr, "[NFQ C-TUNNEL] nfq_open failed\n");
+        tunnel_state.session_error.store(true);
+        return;
+    }
+
+    if(nfq_unbind_pf(h, AF_INET) < 0)
+    {
+        std::fprintf(stderr, "[NFQ C-TUNNEL] nfq_unbind_pf(AF_INET) failed\n");
+        nfq_close(h);
+        tunnel_state.session_error.store(true);
+        return;
+    }
+
+    if(nfq_bind_pf(h, AF_INET) < 0)
+    {
+        std::fprintf(stderr, "[NFQ C-TUNNEL] nfq_bind_pf(AF_INET) failed\n");
+        nfq_close(h);
+        tunnel_state.session_error.store(true);
+        return;
+    }
+
+    ClientTunnelNfqueueContext ctx;
+    ctx.config = &config;
+    ctx.tunnel_state = &tunnel_state;
+
+    nfq_q_handle* qh = nfq_create_queue(h, queue_num, &client_tunnel_callback, &ctx);
+    if(qh == nullptr)
+    {
+        std::fprintf(stderr, "[NFQ C-TUNNEL] nfq_create_queue failed\n");
+        nfq_close(h);
+        tunnel_state.session_error.store(true);
+        return;
+    }
+
+    if(nfq_set_mode(qh, NFQNL_COPY_PACKET, 0xffff) < 0)
+    {
+        std::fprintf(stderr, "[NFQ C-TUNNEL] nfq_set_mode failed\n");
+        nfq_destroy_queue(qh);
+        nfq_close(h);
+        tunnel_state.session_error.store(true);
+        return;
+    }
+
+    if(nfq_set_queue_maxlen(qh, 4096) < 0)
+    {
+        std::fprintf(stderr, "[NFQ C-TUNNEL] warning: nfq_set_queue_maxlen failed\n");
+    }
+
+    int fd = nfq_fd(h);
+    char buf[4096];
+
+    tunnel_state.nfqueue_ready.store(true);
+
+    std::printf("[NFQ C-TUNNEL] tunnel NFQUEUE loop ready on queue %u\n", queue_num);
+
+    while(!stop.load() && !tunnel_state.session_stop.load() && !tunnel_state.session_error.load())
+    {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+
+        timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        int ret = select(fd + 1, &rfds, nullptr, nullptr, &tv);
+        if(ret < 0)
+        {
+            if(errno == EINTR)
+                continue;
+
+            perror("[NFQ C-TUNNEL] select");
+            tunnel_state.session_error.store(true);
+            break;
+        }
+
+        if(ret == 0)
+            continue;
+
+        ssize_t rv = recv(fd, buf, sizeof(buf), 0);
+        if(rv < 0)
+        {
+            if(errno == EINTR)
+                continue;
+
+            perror("[NFQ C-TUNNEL] recv");
+            tunnel_state.session_error.store(true);
+            break;
+        }
+
+        nfq_handle_packet(h, buf, static_cast<int>(rv));
+    }
+
+    tunnel_state.nfqueue_ready.store(false);
+
+    nfq_destroy_queue(qh);
+    nfq_close(h);
+
+    std::printf("[NFQ C-TUNNEL] tunnel NFQUEUE loop stopped\n");
 }

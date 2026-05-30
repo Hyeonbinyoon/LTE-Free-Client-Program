@@ -7,6 +7,7 @@
 #include <atomic>
 #include <thread>
 #include <string>
+#include <functional>
 #include <unistd.h>
 #include <sys/socket.h>
 
@@ -54,248 +55,259 @@ int main(int argc, char* argv[])
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
 
+    int exit_code = 1;
+
     std::atomic<bool> stop(false);
 
     int proxy_fd = -1;
+    int udp_fd = -1;
     int tun_fd = -1;
     int raw_send_fd = -1;
 
-    bool nfqueue_rule_installed = false;
+    bool learning_rule_installed = false;
+    bool tunnel_rule_installed = false;
+    bool tunnel_thread_started = false;
+    bool udp_stop_thread_started = false;
     bool raw_thread_started = false;
 
     RouteSnapshot route;
     ClientRawConfig raw_config;
+    ClientReadyState ready_state;
+    ClientTunnelState tunnel_state;
     RealBase real_base;
     FakeBase fake_base;
     RawSendState raw_send_state;
+    std::string proxy_route;
 
+
+    std::thread tunnel_thread;
+    std::thread udp_stop_thread;
     std::thread raw_thread;
 
-
-    /*
-     * 1. TCP connect
-     *
-     * connect_proxy() 내부에서:
-     * - TCP_MSS 설정
-     * - connect()
-     * - kernel TCP keepalive 설정
-     */
     proxy_fd = connect_proxy(proxy_ip, proxy_port);
     if(proxy_fd < 0)
     {
         std::fprintf(stderr, "failed to connect proxy\n");
-        return 1;
+        goto cleanup;
     }
 
-    /*
-     * 2. raw config 초기화
-     *
-     * control TCP socket의 실제 local IP/local port를 얻고,
-     * proxy IP/port를 함께 저장한다.
-     */
+    udp_fd = open_client_ready_socket();
+    if(udp_fd < 0)
+    {
+        std::fprintf(stderr, "failed to open UDP ready socket\n");
+        goto cleanup;
+    }
+
     if(!init_client_raw_config(proxy_ip, proxy_port, proxy_fd, raw_config))
     {
         std::fprintf(stderr, "failed to initialize raw config\n");
-        close(proxy_fd);
-        return 1;
+        goto cleanup;
     }
 
-    /*
-     * 3. NFQUEUE learning rule 설치
-     *
-     * Proxy -> Client 방향의 control TCP packet을 NFQUEUE로 보낸다.
-     * learning packet은 callback에서 NF_ACCEPT된다.
-     */
+    if(!run_client_udp_register(udp_fd, proxy_ip, proxy_port, ready_state, stop))
+    {
+        std::fprintf(stderr, "failed to complete UDP register\n");
+        goto cleanup;
+    }
+    udp_stop_thread = std::thread(client_udp_stop_loop, udp_fd, std::cref(ready_state), std::ref(tunnel_state), std::ref(stop));
+    udp_stop_thread_started = true;
+
     if(!install_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM))
     {
-        std::fprintf(stderr, "failed to install client NFQUEUE rule\n");
-        close(proxy_fd);
-        return 1;
+        std::fprintf(stderr, "failed to install client learning NFQUEUE rule\n");
+        goto cleanup;
     }
 
-    nfqueue_rule_installed = true;
+    learning_rule_installed = true;
 
-    /*
-     * 4. realBase/fakeBase 학습
-     *
-     * Client는 Proxy -> Client keepalive ACK를 관찰한다.
-     *
-     * expected:
-     *   seq = P + 1
-     *   ack = C + 1
-     *
-     * learned:
-     *   realBase.client_seq = C
-     *   realBase.proxy_seq  = P
-     *
-     * initialized:
-     *   fakeBase.fake_client_seq = C + 1
-     *   fakeBase.fake_proxy_seq  = P + 1
-     */
-    if(!learn_client_tcp_base_with_nfqueue(CLIENT_NFQUEUE_NUM,
-                                           raw_config,
-                                           real_base,
-                                           fake_base,
-                                           stop))
+    if(!learn_client_tcp_base_with_nfqueue(CLIENT_NFQUEUE_NUM, raw_config, real_base, fake_base, tunnel_state.keepalive_ack, stop))
     {
         std::fprintf(stderr, "failed to learn TCP real/fake base\n");
-
-        if(nfqueue_rule_installed)
-            cleanup_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
-
-        close(proxy_fd);
-        return 1;
+        goto cleanup;
     }
 
-    if(!real_base.learned || !fake_base.initialized)
+    if(!real_base.learned || !fake_base.initialized || !tunnel_state.keepalive_ack.learned)
     {
         std::fprintf(stderr, "base learning state is invalid\n");
-
-        if(nfqueue_rule_installed)
-            cleanup_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
-
-        close(proxy_fd);
-        return 1;
+        goto cleanup;
     }
 
-    std::printf("[MAIN] realBase learned: client_seq=%u proxy_seq=%u\n",
-                real_base.client_seq,
-                real_base.proxy_seq);
+    std::printf("[MAIN] realBase learned: client_seq=%u proxy_seq=%u\n", real_base.client_seq, real_base.proxy_seq);
+    std::printf("[MAIN] fakeBase initialized: fake_client_seq=%u fake_proxy_seq=%u\n", fake_base.fake_client_seq, fake_base.fake_proxy_seq);
 
-    std::printf("[MAIN] fakeBase initialized: fake_client_seq=%u fake_proxy_seq=%u\n",
-                fake_base.fake_client_seq,
-                fake_base.fake_proxy_seq);
-if(nfqueue_rule_installed)
-{
-    cleanup_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
-    nfqueue_rule_installed = false;
-}
+    if(learning_rule_installed)
+    {
+        cleanup_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
+        learning_rule_installed = false;
+    }
+
+    if(!install_client_tunnel_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM))
+    {
+        std::fprintf(stderr, "failed to install client tunnel NFQUEUE rule\n");
+        goto cleanup;
+    }
+
+    tunnel_rule_installed = true;
+
+    tunnel_thread = std::thread(client_tunnel_nfqueue_loop, CLIENT_NFQUEUE_NUM, std::cref(raw_config), std::ref(tunnel_state), std::ref(stop));
+    tunnel_thread_started = true;
+
+    while(!stop.load() && !tunnel_state.session_error.load() && !tunnel_state.nfqueue_ready.load())
+        usleep(10 * 1000);
+
+    if(!tunnel_state.nfqueue_ready.load())
+    {
+        std::fprintf(stderr, "client tunnel NFQUEUE loop is not ready\n");
+        goto cleanup;
+    }
+
+    if(!run_client_ready_handshake(udp_fd, proxy_ip, proxy_port, ready_state, stop))
+    {
+        std::fprintf(stderr, "failed to complete UDP ready handshake\n");
+        goto cleanup;
+    }
+
+    if(!ready_state.ready_done)
+    {
+        std::fprintf(stderr, "UDP ready state is invalid\n");
+        goto cleanup;
+    }
+
     /*
-     * 5. tunC 생성/설정
-     *
-     * fakeBase 학습이 끝난 뒤에 tunC를 만들고 route를 넘긴다.
-     */
+    * Both sides confirmed tunnel NFQUEUE readiness.
+    * Wait a short settle time before creating tunC / changing route / starting raw send.
+    */
+    std::printf("[MAIN] UDP ready handshake done. settling before data plane start\n");
+    usleep(1000 * 1000);
+
+
     tun_fd = tun_alloc(CLIENT_TUN_NAME);
     if(tun_fd < 0)
     {
-        cleanup_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
-        close(proxy_fd);
-        return 1;
+        std::fprintf(stderr, "failed to allocate tunC\n");
+        goto cleanup;
     }
 
     if(!setup_tun_interface(CLIENT_TUN_NAME))
     {
-        cleanup_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
-        close(tun_fd);
-        close(proxy_fd);
-        return 1;
+        std::fprintf(stderr, "failed to setup tunC\n");
+        goto cleanup;
     }
 
     if(!set_nonblocking(tun_fd))
     {
-        cleanup_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
-        close(tun_fd);
-        close(proxy_fd);
-        return 1;
+        std::fprintf(stderr, "failed to set tunC nonblocking\n");
+        goto cleanup;
     }
 
-    /*
-     * 6. route 준비
-     *
-     * 현재 default route를 저장한다.
-     * Proxy IP는 tunnel 밖 원래 경로로 나가야 하므로 /32 예외 route를 추가한다.
-     */
     if(!load_default_route(route))
     {
-        cleanup_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
-        close(tun_fd);
-        close(proxy_fd);
-        return 1;
+        std::fprintf(stderr, "failed to load default route\n");
+        goto cleanup;
     }
 
     std::printf("default gateway : %s\n", route.gateway.c_str());
     std::printf("default ifname  : %s\n", route.ifname.c_str());
     std::printf("default src     : %s\n", route.src.c_str());
 
-    std::string proxy_route = std::string(proxy_ip) + "/32";
+    proxy_route = std::string(proxy_ip) + "/32";
     if(!add_route(route, proxy_route))
     {
-        cleanup_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
-        close(tun_fd);
-        close(proxy_fd);
-        return 1;
+        std::fprintf(stderr, "failed to add proxy route exception\n");
+        goto cleanup;
     }
 
     if(!replace_default_route_to_tun(route, CLIENT_TUN_NAME))
     {
-        cleanup_routes(route);
-        cleanup_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
-        close(tun_fd);
-        close(proxy_fd);
-        return 1;
+        std::fprintf(stderr, "failed to replace default route to tunC\n");
+        goto cleanup;
     }
 
-    /*
-     * 7. raw send socket 생성
-     */
+    tunnel_state.tun_fd.store(tun_fd);
+    tunnel_state.data_plane_ready.store(true);
+
     raw_send_fd = open_raw_send_socket();
     if(raw_send_fd < 0)
     {
-        restore_default_route(route);
-        cleanup_routes(route);
-        cleanup_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
-        close(tun_fd);
-        close(proxy_fd);
-        return 1;
+        std::fprintf(stderr, "failed to open raw send socket\n");
+        goto cleanup;
     }
 
-    /*
-     * 8. raw send loop 시작
-     *
-     * fakeBase는 이미 initialized 상태
-     */
-    raw_thread = std::thread(tun_to_raw_loop,
-                             tun_fd,
-                             raw_send_fd,
-                             std::cref(raw_config),
-                             std::cref(fake_base),
-                             std::ref(raw_send_state),
-                             std::ref(stop));
-
+    raw_thread = std::thread(tun_to_raw_loop, tun_fd, raw_send_fd, std::cref(raw_config), std::cref(fake_base), std::ref(raw_send_state), std::ref(stop));
     raw_thread_started = true;
 
-    std::printf("client raw send thread started\n");
+    std::printf("client tunnel data plane started\n");
     std::printf("press Enter or Ctrl+C to stop\n");
 
-    wait_for_stop_request();
+    if(!wait_for_stop_request(tunnel_state.session_stop, tunnel_state.session_error))
+    {
+        std::fprintf(stderr, "client stopped by session error\n");
+        goto cleanup;
+    }
 
-    /*
-     * cleanup
-     */
+    exit_code = 0;
+
+
+cleanup:
+    if(udp_fd >= 0 && ready_state.registered && !tunnel_state.session_stop.load())
+        send_client_udp_stop(udp_fd, proxy_ip, proxy_port, ready_state);
+
     stop.store(true);
-
-    restore_default_route(route);
-    cleanup_routes(route);
-
-    if(nfqueue_rule_installed)
-        cleanup_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
-
-    if(proxy_fd >= 0)
-        shutdown(proxy_fd, SHUT_RDWR);
+    tunnel_state.session_stop.store(true);
+    tunnel_state.data_plane_ready.store(false);
 
     if(raw_thread_started && raw_thread.joinable())
         raw_thread.join();
 
+    restore_default_route(route);
+    cleanup_routes(route);
+
+    if(tunnel_rule_installed)
+    {
+        cleanup_client_tunnel_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
+        tunnel_rule_installed = false;
+    }
+
+    if(learning_rule_installed)
+    {
+        cleanup_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM);
+        learning_rule_installed = false;
+    }
+
+    if(tunnel_thread_started && tunnel_thread.joinable())
+        tunnel_thread.join();
+
+    if(udp_stop_thread_started && udp_stop_thread.joinable())
+        udp_stop_thread.join();
+
     if(raw_send_fd >= 0)
+    {
         close(raw_send_fd);
+        raw_send_fd = -1;
+    }
 
     if(tun_fd >= 0)
+    {
         close(tun_fd);
+        tun_fd = -1;
+    }
 
     if(proxy_fd >= 0)
+    {
         close(proxy_fd);
+        proxy_fd = -1;
+    }
 
-    std::printf("client stopped\n");
+    if(udp_fd >= 0)
+    {
+        close(udp_fd);
+        udp_fd = -1;
+    }
 
-    return 0;
+    if(exit_code == 0)
+        std::printf("client stopped\n");
+    else
+        std::fprintf(stderr, "client stopped with error\n");
+
+    return exit_code;
 }

@@ -27,6 +27,46 @@ struct ClientRawConfig
     uint16_t proxy_port;
 };
 
+struct ClientReadyState
+{
+    std::string client_nonce;
+    std::string proxy_nonce;
+    bool registered = false;
+    bool ready_done = false;
+};
+
+struct ClientKeepaliveAckFingerprint
+{
+    uint32_t ip_src = 0;
+    uint32_t ip_dst = 0;
+    uint16_t tcp_src = 0;
+    uint16_t tcp_dst = 0;
+    uint32_t seq = 0;
+    uint32_t ack = 0;
+    uint8_t flags = 0;
+    bool learned = false;
+};
+
+struct ClientTunnelState
+{
+    std::atomic<int> tun_fd;
+    std::atomic<bool> nfqueue_ready;
+    std::atomic<bool> data_plane_ready;
+    std::atomic<bool> session_stop;
+    std::atomic<bool> session_error;
+
+    ClientKeepaliveAckFingerprint keepalive_ack;
+
+    ClientTunnelState()
+        : tun_fd(-1),
+          nfqueue_ready(false),
+          data_plane_ready(false),
+          session_stop(false),
+          session_error(false)
+    {
+    }
+};
+
 struct RealBase
 {
     uint32_t client_seq = 0;
@@ -84,17 +124,38 @@ void print_ipv4_packet_info(const std::vector<uint8_t>& packet);
 
 
 
-//for free LTE
+
+
+/////// for free LTE
+
+// tcp/udp socket
+int open_client_ready_socket();
+
+// udp
+bool run_client_udp_register(int udp_fd, const char* proxy_ip, uint16_t ready_port, ClientReadyState& state, std::atomic<bool>& stop);
+bool run_client_ready_handshake(int udp_fd, const char* proxy_ip, uint16_t ready_port, ClientReadyState& state, std::atomic<bool>& stop);
+void send_client_udp_stop(int udp_fd, const char* proxy_ip, uint16_t ready_port, const ClientReadyState& state);
+bool wait_for_stop_request(std::atomic<bool>& session_stop, std::atomic<bool>& session_error);
+void client_udp_stop_loop(int udp_fd, const ClientReadyState& state, ClientTunnelState& tunnel_state, std::atomic<bool>& stop);
+
+// raw socket
 bool init_client_raw_config(const char* proxy_ip, uint16_t proxy_port, int proxy_fd, ClientRawConfig& config);
 int open_raw_send_socket();
 void tun_to_raw_loop(int tun_fd, int raw_send_fd, const ClientRawConfig& config, const FakeBase& fake_base, RawSendState& send_state, std::atomic<bool>& stop);
 
+// tcp keepalive & learning
 bool set_tcp_keepalive(int sock, int idle, int interval, int count);
 bool get_socket_local_tuple(int sock, uint32_t& local_ip, uint16_t& local_port);
 
+// learning
 bool install_client_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_num);
 void cleanup_client_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_num);
-bool learn_client_tcp_base_with_nfqueue(uint16_t queue_num, const ClientRawConfig& config, RealBase& real_base, FakeBase& fake_base, std::atomic<bool>& stop);
+bool learn_client_tcp_base_with_nfqueue(uint16_t queue_num, const ClientRawConfig& config, RealBase& real_base, FakeBase& fake_base, ClientKeepaliveAckFingerprint& keepalive_ack, std::atomic<bool>& stop);
 
-//
+// final nfqueue rule
+bool install_client_tunnel_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_num);
+void cleanup_client_tunnel_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_num);
+void client_tunnel_nfqueue_loop(uint16_t queue_num, const ClientRawConfig& config, ClientTunnelState& tunnel_state, std::atomic<bool>& stop);
+
 #endif
+// CLINET_H

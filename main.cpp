@@ -175,6 +175,8 @@ int main(int argc, char* argv[])
 
     std::printf("[MAIN] UDP ready handshake done. settling before data plane start\n");
     usleep(1000 * 1000);
+    if(stop.load() || tunnel_state.session_stop.load() || tunnel_state.session_error.load())
+    goto cleanup;
 
     tun_fd = tun_alloc(CLIENT_TUN_NAME);
     if(tun_fd < 0)
@@ -217,6 +219,9 @@ int main(int argc, char* argv[])
         std::fprintf(stderr, "failed to replace default route to tunC\n");
         goto cleanup;
     }
+    
+    if(stop.load() || tunnel_state.session_stop.load() || tunnel_state.session_error.load())
+        goto cleanup;
 
     tunnel_state.tun_fd.store(tun_fd);
     tunnel_state.data_plane_ready.store(true);

@@ -7,6 +7,7 @@
 #include <csignal>
 #include <string>
 #include <vector>
+#include <mutex>
 
 #define CLIENT_TUN_NAME "tunC"
 #define CLIENT_TUN_IP_CIDR "10.8.0.2/30"
@@ -31,8 +32,13 @@ struct ClientReadyState
 {
     std::string client_nonce;
     std::string proxy_nonce;
+
     bool registered = false;
+    bool proxy_ready_ack_received = false;
     bool ready_done = false;
+    bool stop_received = false;
+
+    mutable std::mutex lock;
 };
 
 struct ClientKeepaliveAckFingerprint
@@ -136,7 +142,7 @@ bool run_client_udp_register(int udp_fd, const char* proxy_ip, uint16_t ready_po
 bool run_client_ready_handshake(int udp_fd, const char* proxy_ip, uint16_t ready_port, ClientReadyState& state, std::atomic<bool>& stop);
 void send_client_udp_stop(int udp_fd, const char* proxy_ip, uint16_t ready_port, const ClientReadyState& state);
 bool wait_for_stop_request(std::atomic<bool>& session_stop, std::atomic<bool>& session_error);
-void client_udp_stop_loop(int udp_fd, const ClientReadyState& state, ClientTunnelState& tunnel_state, std::atomic<bool>& stop);
+void client_udp_control_loop(int udp_fd, ClientReadyState& state, ClientTunnelState& tunnel_state, std::atomic<bool>& stop);
 
 // raw socket
 bool init_client_raw_config(const char* proxy_ip, uint16_t proxy_port, int proxy_fd, ClientRawConfig& config);

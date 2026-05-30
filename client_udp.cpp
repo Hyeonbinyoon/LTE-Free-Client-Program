@@ -10,6 +10,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <mutex>
 
 #define CLIENT_UDP_REGISTER_PREFIX "CUSTOMVPN_CLIENT_UDP_REGISTER_2024350225:"
 #define PROXY_UDP_REGISTER_ACK_PREFIX "CUSTOMVPN_PROXY_UDP_REGISTER_ACK_2024350225:"
@@ -138,14 +139,45 @@ static uint64_t now_ms()
 
 static bool is_valid_udp_stop(const std::string& msg, const ClientReadyState& state)
 {
-    if(state.client_nonce.empty() || state.proxy_nonce.empty())
+    std::string client_nonce;
+    std::string proxy_nonce;
+
+    {
+        std::lock_guard<std::mutex> guard(state.lock);
+        client_nonce = state.client_nonce;
+        proxy_nonce = state.proxy_nonce;
+    }
+
+    if(client_nonce.empty() || proxy_nonce.empty())
         return false;
 
-    std::string expected = std::string(UDP_STOP_PREFIX) + state.client_nonce + ":" + state.proxy_nonce;
+    std::string expected = std::string(UDP_STOP_PREFIX) + client_nonce + ":" + proxy_nonce;
 
     return msg == expected;
 }
 
+static bool is_valid_proxy_ready_ack(const std::string& msg, const ClientReadyState& state)
+{
+    if(!starts_with(msg, PROXY_TUNNEL_READY_ACK_PREFIX))
+        return false;
+
+    std::string client_nonce;
+    std::string proxy_nonce;
+
+    {
+        std::lock_guard<std::mutex> guard(state.lock);
+        client_nonce = state.client_nonce;
+        proxy_nonce = state.proxy_nonce;
+    }
+
+    if(client_nonce.empty() || proxy_nonce.empty())
+        return false;
+
+    std::string body = msg.substr(std::strlen(PROXY_TUNNEL_READY_ACK_PREFIX));
+    std::string expected_body = client_nonce + ":" + proxy_nonce;
+
+    return body == expected_body;
+}
 
 
 // Client UDP endpoint를 Proxy에 등록하고, Proxy nonce를 획득
@@ -243,18 +275,28 @@ bool run_client_ready_handshake(int udp_fd, const char* proxy_ip, uint16_t ready
         return false;
     }
 
-    if(!state.registered || state.client_nonce.empty() || state.proxy_nonce.empty())
+    std::string client_nonce;
+    std::string proxy_nonce;
+
     {
-        std::fprintf(stderr, "[UDP READY] UDP register is not completed\n");
-        return false;
+        std::lock_guard<std::mutex> guard(state.lock);
+
+        if(!state.registered || state.client_nonce.empty() || state.proxy_nonce.empty())
+        {
+            std::fprintf(stderr, "[UDP READY] UDP register is not completed\n");
+            return false;
+        }
+
+        client_nonce = state.client_nonce;
+        proxy_nonce = state.proxy_nonce;
     }
 
     sockaddr_in proxy_addr;
     if(!make_proxy_addr(proxy_ip, ready_port, proxy_addr))
         return false;
 
-    std::string ready_msg = std::string(CLIENT_TUNNEL_READY_PREFIX) + state.client_nonce;
-    std::string start_ack_msg = std::string(CLIENT_START_ACK_PREFIX) + state.proxy_nonce;
+    std::string ready_msg = std::string(CLIENT_TUNNEL_READY_PREFIX) + client_nonce;
+    std::string start_ack_msg = std::string(CLIENT_START_ACK_PREFIX) + proxy_nonce;
 
     uint64_t start_time = now_ms();
     uint64_t next_send_time = 0;
@@ -263,6 +305,41 @@ bool run_client_ready_handshake(int udp_fd, const char* proxy_ip, uint16_t ready
 
     while(!g_signal_stop && !stop.load())
     {
+        bool proxy_ready_ack_received = false;
+        bool stop_received = false;
+
+        {
+            std::lock_guard<std::mutex> guard(state.lock);
+            proxy_ready_ack_received = state.proxy_ready_ack_received;
+            stop_received = state.stop_received;
+        }
+
+        if(stop_received)
+        {
+            std::fprintf(stderr, "[UDP READY] stop received while waiting READY_ACK\n");
+            return false;
+        }
+
+        if(proxy_ready_ack_received)
+        {
+            for(int i = 0; i < 3; ++i)
+            {
+                if(!udp_send_string(udp_fd, proxy_addr, start_ack_msg))
+                    return false;
+
+                std::printf("[UDP READY] sent CLIENT_START_ACK\n");
+                usleep(100 * 1000);
+            }
+
+            {
+                std::lock_guard<std::mutex> guard(state.lock);
+                state.ready_done = true;
+            }
+
+            std::printf("[UDP READY] done\n");
+            return true;
+        }
+
         uint64_t current_time = now_ms();
 
         if(current_time - start_time >= UDP_TIMEOUT_SECONDS * 1000ULL)
@@ -281,57 +358,7 @@ bool run_client_ready_handshake(int udp_fd, const char* proxy_ip, uint16_t ready
             next_send_time = current_time + UDP_RETRY_INTERVAL_MS;
         }
 
-        std::string recv_msg;
-        if(!udp_recv_string(udp_fd, recv_msg, UDP_RETRY_INTERVAL_MS))
-            continue;
-
-        if(starts_with(recv_msg, UDP_STOP_PREFIX))
-        {
-            if(is_valid_udp_stop(recv_msg, state))
-            {
-                std::fprintf(stderr, "[UDP READY] received valid UDP STOP\n");
-                stop.store(true);
-                return false;
-            }
-
-            std::printf("[UDP READY] ignore UDP STOP with wrong nonce: %s\n",
-                        recv_msg.c_str());
-            continue;
-        }
-
-        if(!starts_with(recv_msg, PROXY_TUNNEL_READY_ACK_PREFIX))
-        {
-            std::printf("[UDP READY] ignore unexpected UDP message: %s\n",
-                        recv_msg.c_str());
-            continue;
-        }
-
-        std::string body = recv_msg.substr(std::strlen(PROXY_TUNNEL_READY_ACK_PREFIX));
-        std::string expected_body = state.client_nonce + ":" + state.proxy_nonce;
-
-        if(body != expected_body)
-        {
-            std::printf("[UDP READY] ignore READY_ACK with wrong nonce: %s\n", recv_msg.c_str());
-            continue;
-        }
-
-        /*
-         * Proxy tunnel NFQUEUE 완료
-         * START_ACK 3번 보냄
-         */
-        for(int i = 0; i < 3; ++i)
-        {
-            if(!udp_send_string(udp_fd, proxy_addr, start_ack_msg))
-                return false;
-
-            std::printf("[UDP READY] sent CLIENT_START_ACK\n");
-            usleep(100 * 1000);
-        }
-
-        state.ready_done = true;
-
-        std::printf("[UDP READY] done\n");
-        return true;
+        usleep(10 * 1000);
     }
 
     return false;
@@ -347,7 +374,16 @@ void send_client_udp_stop(int udp_fd, const char* proxy_ip, uint16_t ready_port,
         return;
     }
 
-    if(state.client_nonce.empty() || state.proxy_nonce.empty())
+    std::string client_nonce;
+    std::string proxy_nonce;
+
+    {
+        std::lock_guard<std::mutex> guard(state.lock);
+        client_nonce = state.client_nonce;
+        proxy_nonce = state.proxy_nonce;
+    }
+
+    if(client_nonce.empty() || proxy_nonce.empty())
     {
         std::fprintf(stderr, "[UDP STOP] nonce is not ready. skip UDP STOP\n");
         return;
@@ -357,7 +393,8 @@ void send_client_udp_stop(int udp_fd, const char* proxy_ip, uint16_t ready_port,
     if(!make_proxy_addr(proxy_ip, ready_port, proxy_addr))
         return;
 
-    std::string stop_msg = std::string(UDP_STOP_PREFIX) + state.client_nonce + ":" + state.proxy_nonce;
+    std::string stop_msg = std::string(UDP_STOP_PREFIX) + client_nonce + ":" + proxy_nonce;
+
     for(int i = 0; i < UDP_STOP_REPEAT_COUNT; ++i)
     {
         if(!udp_send_string(udp_fd, proxy_addr, stop_msg))
@@ -371,77 +408,50 @@ void send_client_udp_stop(int udp_fd, const char* proxy_ip, uint16_t ready_port,
     }
 }
 
-
-void client_udp_stop_loop(int udp_fd, const ClientReadyState& state, ClientTunnelState& tunnel_state, std::atomic<bool>& stop)
+void client_udp_control_loop(int udp_fd, ClientReadyState& state, ClientTunnelState& tunnel_state, std::atomic<bool>& stop)
 {
     while(!g_signal_stop && !stop.load() && !tunnel_state.session_stop.load() && !tunnel_state.session_error.load())
     {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(udp_fd, &rfds);
-
-        timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = UDP_RETRY_INTERVAL_MS * 1000;
-
-        int ret = select(udp_fd + 1, &rfds, nullptr, nullptr, &tv);
-        if(ret == 0)
+        std::string recv_msg;
+        if(!udp_recv_string(udp_fd, recv_msg, UDP_RETRY_INTERVAL_MS))
             continue;
 
-        if(ret < 0)
+        if(starts_with(recv_msg, UDP_STOP_PREFIX))
         {
-            if(errno == EINTR)
+            if(!is_valid_udp_stop(recv_msg, state))
+            {
+                std::printf("[UDP CONTROL] ignore UDP STOP with wrong nonce: %s\n", recv_msg.c_str());
                 continue;
+            }
 
-            perror("[UDP STOP] select");
-            tunnel_state.session_error.store(true);
+            {
+                std::lock_guard<std::mutex> guard(state.lock);
+                state.stop_received = true;
+            }
+
+            std::fprintf(stderr, "[UDP CONTROL] received valid UDP STOP\n");
+            tunnel_state.session_stop.store(true);
+            stop.store(true);
             return;
         }
 
-        char buf[UDP_BUFFER_SIZE];
-        ssize_t n = recvfrom(udp_fd, buf, sizeof(buf) - 1, MSG_PEEK, nullptr, nullptr);
-        if(n < 0)
+        if(starts_with(recv_msg, PROXY_TUNNEL_READY_ACK_PREFIX))
         {
-            if(errno == EINTR)
+            if(!is_valid_proxy_ready_ack(recv_msg, state))
+            {
+                std::printf("[UDP CONTROL] ignore READY_ACK with wrong nonce: %s\n", recv_msg.c_str());
                 continue;
+            }
 
-            perror("[UDP STOP] recvfrom MSG_PEEK");
-            tunnel_state.session_error.store(true);
-            return;
-        }
+            {
+                std::lock_guard<std::mutex> guard(state.lock);
+                state.proxy_ready_ack_received = true;
+            }
 
-        buf[n] = '\0';
-        std::string peek_msg(buf, static_cast<size_t>(n));
-
-        if(!starts_with(peek_msg, UDP_STOP_PREFIX))
-        {
-            usleep(10 * 1000);
+            std::printf("[UDP CONTROL] received valid PROXY_READY_ACK\n");
             continue;
         }
 
-        n = recvfrom(udp_fd, buf, sizeof(buf) - 1, 0, nullptr, nullptr);
-        if(n < 0)
-        {
-            if(errno == EINTR)
-                continue;
-
-            perror("[UDP STOP] recvfrom");
-            tunnel_state.session_error.store(true);
-            return;
-        }
-
-        buf[n] = '\0';
-        std::string recv_msg(buf, static_cast<size_t>(n));
-
-        if(!is_valid_udp_stop(recv_msg, state))
-        {
-            std::printf("[UDP STOP] ignore UDP STOP with wrong nonce: %s\n", recv_msg.c_str());
-            continue;
-        }
-
-        std::fprintf(stderr, "[UDP STOP] received valid UDP STOP\n");
-        tunnel_state.session_stop.store(true);
-        stop.store(true);
-        return;
+        std::printf("[UDP CONTROL] ignore unexpected UDP message: %s\n", recv_msg.c_str());
     }
 }

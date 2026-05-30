@@ -67,7 +67,7 @@ int main(int argc, char* argv[])
     bool learning_rule_installed = false;
     bool tunnel_rule_installed = false;
     bool tunnel_thread_started = false;
-    bool udp_stop_thread_started = false;
+    bool udp_control_thread_started = false;
     bool raw_thread_started = false;
 
     RouteSnapshot route;
@@ -79,9 +79,8 @@ int main(int argc, char* argv[])
     RawSendState raw_send_state;
     std::string proxy_route;
 
-
     std::thread tunnel_thread;
-    std::thread udp_stop_thread;
+    std::thread udp_control_thread;
     std::thread raw_thread;
 
     proxy_fd = connect_proxy(proxy_ip, proxy_port);
@@ -109,8 +108,9 @@ int main(int argc, char* argv[])
         std::fprintf(stderr, "failed to complete UDP register\n");
         goto cleanup;
     }
-    udp_stop_thread = std::thread(client_udp_stop_loop, udp_fd, std::cref(ready_state), std::ref(tunnel_state), std::ref(stop));
-    udp_stop_thread_started = true;
+
+    udp_control_thread = std::thread(client_udp_control_loop, udp_fd, std::ref(ready_state), std::ref(tunnel_state), std::ref(stop));
+    udp_control_thread_started = true;
 
     if(!install_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM))
     {
@@ -173,13 +173,8 @@ int main(int argc, char* argv[])
         goto cleanup;
     }
 
-    /*
-    * Both sides confirmed tunnel NFQUEUE readiness.
-    * Wait a short settle time before creating tunC / changing route / starting raw send.
-    */
     std::printf("[MAIN] UDP ready handshake done. settling before data plane start\n");
     usleep(1000 * 1000);
-
 
     tun_fd = tun_alloc(CLIENT_TUN_NAME);
     if(tun_fd < 0)
@@ -247,7 +242,6 @@ int main(int argc, char* argv[])
 
     exit_code = 0;
 
-
 cleanup:
     if(udp_fd >= 0 && ready_state.registered && !tunnel_state.session_stop.load())
         send_client_udp_stop(udp_fd, proxy_ip, proxy_port, ready_state);
@@ -277,8 +271,8 @@ cleanup:
     if(tunnel_thread_started && tunnel_thread.joinable())
         tunnel_thread.join();
 
-    if(udp_stop_thread_started && udp_stop_thread.joinable())
-        udp_stop_thread.join();
+    if(udp_control_thread_started && udp_control_thread.joinable())
+        udp_control_thread.join();
 
     if(raw_send_fd >= 0)
     {

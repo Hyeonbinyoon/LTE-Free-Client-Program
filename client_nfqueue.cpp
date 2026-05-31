@@ -170,7 +170,7 @@ static int client_learning_callback(nfq_q_handle* qh, nfgenmsg*, nfq_data* nfad,
     }
 
     ctx->real_base->client_seq = parsed.ack - 1;
-    ctx->real_base->proxy_seq = parsed.seq;
+    ctx->real_base->proxy_seq = parsed.seq -1;
     ctx->real_base->learned = true;
 
     ctx->fake_base->fake_client_seq = ctx->real_base->client_seq + 1;
@@ -596,6 +596,9 @@ void client_tunnel_nfqueue_loop(uint16_t queue_num, const ClientRawConfig& confi
             if(errno == EINTR)
                 continue;
 
+            if(errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)
+                continue;
+
             perror("[NFQ C-TUNNEL] recv");
             tunnel_state.session_error.store(true);
             break;
@@ -611,3 +614,5 @@ void client_tunnel_nfqueue_loop(uint16_t queue_num, const ClientRawConfig& confi
 
     std::printf("[NFQ C-TUNNEL] tunnel NFQUEUE loop stopped\n");
 }
+
+

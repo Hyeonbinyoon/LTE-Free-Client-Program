@@ -79,11 +79,11 @@ int connect_proxy(const char* proxy_ip, uint16_t proxy_port)
         return -1;
     }
 
-    if(!set_tcp_keepalive(sock, 5, 1, 3))
+   /* if(!set_tcp_keepalive(sock, 5, 1, 3))
     {
         close(sock);
         return -1;
-    }
+    } */
 
     std::printf("connected to proxy %s:%u\n", proxy_ip, proxy_port);
 

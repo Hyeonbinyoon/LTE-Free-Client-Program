@@ -170,7 +170,7 @@ static int client_learning_callback(nfq_q_handle* qh, nfgenmsg*, nfq_data* nfad,
     }
 
     ctx->real_base->client_seq = parsed.ack - 1;
-    ctx->real_base->proxy_seq = parsed.seq - 1;
+    ctx->real_base->proxy_seq = parsed.seq;
     ctx->real_base->learned = true;
 
     ctx->fake_base->fake_client_seq = ctx->real_base->client_seq + 1;
@@ -209,6 +209,9 @@ static bool is_client_learned_keepalive_ack(const ParsedOuterTcpPacket& parsed, 
     if(parsed.payload_len != 0)
         return false;
 
+    if(parsed.tcp->flags != TCP_FLAG_ACK)
+        return false;
+
     if(parsed.ip->src_ip != learned.ip_src)
         return false;
 
@@ -221,13 +224,13 @@ static bool is_client_learned_keepalive_ack(const ParsedOuterTcpPacket& parsed, 
     if(parsed.tcp->dst_port_value() != learned.tcp_dst)
         return false;
 
-    if(parsed.seq != learned.seq)
-        return false;
-
     if(parsed.ack != learned.ack)
         return false;
 
-    if(parsed.tcp->flags != learned.flags)
+    uint32_t proxy_keepalive_probe_seq = learned.seq;
+    uint32_t proxy_normal_ack_seq = learned.seq + 1;
+
+    if(parsed.seq != proxy_keepalive_probe_seq && parsed.seq != proxy_normal_ack_seq)
         return false;
 
     return true;

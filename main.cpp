@@ -112,6 +112,12 @@ int main(int argc, char* argv[])
     udp_control_thread = std::thread(client_udp_control_loop, udp_fd, std::ref(ready_state), std::ref(tunnel_state), std::ref(stop));
     udp_control_thread_started = true;
 
+    if(!wait_for_proxy_learn_ready(ready_state, stop))
+    {
+        std::fprintf(stderr, "[MAIN] failed to wait for PROXY_LEARN_READY\n");
+        goto cleanup;
+    }
+
     if(!install_client_nfqueue_rule(raw_config, CLIENT_NFQUEUE_NUM))
     {
         std::fprintf(stderr, "failed to install client learning NFQUEUE rule\n");
@@ -120,13 +126,13 @@ int main(int argc, char* argv[])
 
     learning_rule_installed = true;
 
-    if(!learn_client_tcp_base_with_nfqueue(CLIENT_NFQUEUE_NUM, raw_config, real_base, fake_base, tunnel_state.keepalive_ack, stop))
+    if(!learn_client_tcp_base_with_nfqueue(CLIENT_NFQUEUE_NUM, proxy_fd, raw_config, real_base, fake_base, tunnel_state.control_ack, stop))
     {
         std::fprintf(stderr, "failed to learn TCP real/fake base\n");
         goto cleanup;
     }
 
-    if(!real_base.learned || !fake_base.initialized || !tunnel_state.keepalive_ack.learned)
+    if(!real_base.learned || !fake_base.initialized || !tunnel_state.control_ack.learned)
     {
         std::fprintf(stderr, "base learning state is invalid\n");
         goto cleanup;
@@ -152,8 +158,17 @@ int main(int argc, char* argv[])
     tunnel_thread = std::thread(client_tunnel_nfqueue_loop, CLIENT_NFQUEUE_NUM, std::cref(raw_config), std::ref(tunnel_state), std::ref(stop));
     tunnel_thread_started = true;
 
-    while(!stop.load() && !tunnel_state.session_error.load() && !tunnel_state.nfqueue_ready.load())
+    while(!g_signal_stop &&
+          !stop.load() &&
+          !tunnel_state.session_stop.load() &&
+          !tunnel_state.session_error.load() &&
+          !tunnel_state.nfqueue_ready.load())
+    {
         usleep(10 * 1000);
+    }
+
+    if(g_signal_stop || stop.load() || tunnel_state.session_stop.load() || tunnel_state.session_error.load())
+        goto cleanup;
 
     if(!tunnel_state.nfqueue_ready.load())
     {
@@ -174,9 +189,14 @@ int main(int argc, char* argv[])
     }
 
     std::printf("[MAIN] UDP ready handshake done. settling before data plane start\n");
-    usleep(1000 * 1000);
-    if(stop.load() || tunnel_state.session_stop.load() || tunnel_state.session_error.load())
-    goto cleanup;
+
+    for(int i = 0; i < 100; ++i)
+    {
+        if(g_signal_stop || stop.load() || tunnel_state.session_stop.load() || tunnel_state.session_error.load())
+            goto cleanup;
+
+        usleep(100 * 1000);
+    }
 
     tun_fd = tun_alloc(CLIENT_TUN_NAME);
     if(tun_fd < 0)
@@ -219,12 +239,9 @@ int main(int argc, char* argv[])
         std::fprintf(stderr, "failed to replace default route to tunC\n");
         goto cleanup;
     }
-    
+
     if(stop.load() || tunnel_state.session_stop.load() || tunnel_state.session_error.load())
         goto cleanup;
-
-    tunnel_state.tun_fd.store(tun_fd);
-    tunnel_state.data_plane_ready.store(true);
 
     raw_send_fd = open_raw_send_socket();
     if(raw_send_fd < 0)
@@ -232,6 +249,9 @@ int main(int argc, char* argv[])
         std::fprintf(stderr, "failed to open raw send socket\n");
         goto cleanup;
     }
+
+    tunnel_state.tun_fd.store(tun_fd);
+    tunnel_state.data_plane_ready.store(true);
 
     raw_thread = std::thread(tun_to_raw_loop, tun_fd, raw_send_fd, std::cref(raw_config), std::cref(fake_base), std::ref(raw_send_state), std::ref(stop));
     raw_thread_started = true;

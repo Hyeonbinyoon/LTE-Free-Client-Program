@@ -12,6 +12,7 @@
 #include <linux/netfilter.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
 
+
 static constexpr uint8_t TCP_FLAG_FIN = 0x01;
 static constexpr uint8_t TCP_FLAG_SYN = 0x02;
 static constexpr uint8_t TCP_FLAG_RST = 0x04;
@@ -32,7 +33,7 @@ struct ClientNfqueueContext
     const ClientRawConfig* config = nullptr;
     RealBase* real_base = nullptr;
     FakeBase* fake_base = nullptr;
-    ClientKeepaliveAckFingerprint* keepalive_ack = nullptr;
+    ClientControlAckState* control_ack = nullptr;
     bool learned = false;
 };
 
@@ -126,15 +127,82 @@ static bool parse_proxy_to_client_tcp_packet(const uint8_t* packet, size_t packe
     return true;
 }
 
-static bool is_client_learning_keepalive_ack(const ParsedOuterTcpPacket& parsed)
+static bool parse_client_to_proxy_tcp_packet(const uint8_t* packet, size_t packet_len, const ClientRawConfig& config, ParsedOuterTcpPacket& parsed)
+{
+    if(packet == nullptr)
+        return false;
+
+    if(packet_len < HB_IPV4_H_SIZE)
+        return false;
+
+    const hb_ip_hdr* ip = reinterpret_cast<const hb_ip_hdr*>(packet);
+
+    if(ip->version() != IP_VERSION_IPv4)
+        return false;
+
+    if(ip->protocol_value() != IP_PROTOCOL_TCP)
+        return false;
+
+    size_t ip_header_len = ip->header_len();
+    if(ip_header_len < HB_IPV4_H_SIZE)
+        return false;
+
+    if(packet_len < ip_header_len + HB_TCP_H_SIZE)
+        return false;
+
+    uint16_t ip_total_len = ip->total_length();
+    if(ip_total_len < ip_header_len + HB_TCP_H_SIZE)
+        return false;
+
+    if(packet_len < ip_total_len)
+        return false;
+
+    if(ip->src_ip != config.local_ip)
+        return false;
+
+    if(ip->dst_ip != config.proxy_ip)
+        return false;
+
+    const hb_tcp_hdr* tcp = reinterpret_cast<const hb_tcp_hdr*>(packet + ip_header_len);
+
+    size_t tcp_header_len = tcp->header_len();
+    if(tcp_header_len < HB_TCP_H_SIZE)
+        return false;
+
+    if(ip_total_len < ip_header_len + tcp_header_len)
+        return false;
+
+    if(tcp->src_port_value() != config.local_port)
+        return false;
+
+    if(tcp->dst_port_value() != config.proxy_port)
+        return false;
+
+    size_t payload_offset = ip_header_len + tcp_header_len;
+    size_t payload_len = ip_total_len - payload_offset;
+
+    parsed.ip = ip;
+    parsed.tcp = tcp;
+    parsed.payload = packet + payload_offset;
+    parsed.payload_len = payload_len;
+    parsed.seq = ntohl(tcp->seq_num);
+    parsed.ack = ntohl(tcp->ack_num);
+
+    return true;
+}
+
+static bool is_client_learning_marker_packet(const ParsedOuterTcpPacket& parsed)
 {
     if(parsed.tcp == nullptr)
         return false;
 
-    if(parsed.payload_len != 0)
+    if(parsed.payload == nullptr)
         return false;
 
-    if(parsed.tcp->flags != TCP_FLAG_ACK)
+    if(parsed.payload_len != 1)
+        return false;
+
+    if(parsed.payload[0] != static_cast<uint8_t>(TCP_LEARN_MARKER))
         return false;
 
     return true;
@@ -151,54 +219,62 @@ static int client_learning_callback(nfq_q_handle* qh, nfgenmsg*, nfq_data* nfad,
     if(payload_len < 0)
     {
         std::fprintf(stderr, "[NFQ C-LEARN] failed to get payload\n");
-        return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
+        return nfq_set_verdict(qh, packet_id, NF_ACCEPT, 0, nullptr);
     }
 
     ParsedOuterTcpPacket parsed;
-    if(!parse_proxy_to_client_tcp_packet(raw_payload, static_cast<size_t>(payload_len), *ctx->config, parsed))
+    if(!parse_client_to_proxy_tcp_packet(raw_payload, static_cast<size_t>(payload_len), *ctx->config, parsed))
     {
-        std::fprintf(stderr, "[NFQ C-LEARN] drop unparsed packet\n");
-        return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
+        std::fprintf(stderr, "[NFQ C-LEARN] accept unparsed packet\n");
+        return nfq_set_verdict(qh, packet_id, NF_ACCEPT, 0, nullptr);
     }
 
-    std::printf("[NFQ C-LEARN] tcp packet seq=%u ack=%u flags=0x%02x payload_len=%zu\n", parsed.seq, parsed.ack, parsed.tcp->flags, parsed.payload_len);
+    std::printf("[NFQ C-LEARN] tcp packet seq=%u ack=%u flags=0x%02x payload_len=%zu\n",
+                parsed.seq,
+                parsed.ack,
+                parsed.tcp->flags,
+                parsed.payload_len);
 
-    if(!is_client_learning_keepalive_ack(parsed))
+    if(!is_client_learning_marker_packet(parsed))
     {
-        std::fprintf(stderr, "[NFQ C-LEARN] drop non-keepalive packet flags=0x%02x payload_len=%zu\n", parsed.tcp->flags, parsed.payload_len);
-        return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
+        return nfq_set_verdict(qh, packet_id, NF_ACCEPT, 0, nullptr);
     }
 
-    ctx->real_base->client_seq = parsed.ack - 1;
-    ctx->real_base->proxy_seq = parsed.seq -1;
+    ctx->real_base->client_seq = parsed.seq;
+    ctx->real_base->proxy_seq = parsed.ack - 1;
     ctx->real_base->learned = true;
 
-    ctx->fake_base->fake_client_seq = ctx->real_base->client_seq + 1;
-    ctx->fake_base->fake_proxy_seq = ctx->real_base->proxy_seq + 1;
+    ctx->fake_base->fake_client_seq = parsed.seq + 1;
+    ctx->fake_base->fake_proxy_seq = parsed.ack;
     ctx->fake_base->initialized = true;
 
-    if(ctx->keepalive_ack != nullptr)
+    if(ctx->control_ack != nullptr)
     {
-        ctx->keepalive_ack->ip_src = parsed.ip->src_ip;
-        ctx->keepalive_ack->ip_dst = parsed.ip->dst_ip;
-        ctx->keepalive_ack->tcp_src = parsed.tcp->src_port_value();
-        ctx->keepalive_ack->tcp_dst = parsed.tcp->dst_port_value();
-        ctx->keepalive_ack->seq = parsed.seq;
-        ctx->keepalive_ack->ack = parsed.ack;
-        ctx->keepalive_ack->flags = parsed.tcp->flags;
-        ctx->keepalive_ack->learned = true;
+        ctx->control_ack->ip_src = ctx->config->proxy_ip;
+        ctx->control_ack->ip_dst = ctx->config->local_ip;
+        ctx->control_ack->tcp_src = ctx->config->proxy_port;
+        ctx->control_ack->tcp_dst = ctx->config->local_port;
+        ctx->control_ack->seq = ctx->fake_base->fake_proxy_seq;
+        ctx->control_ack->ack = ctx->fake_base->fake_client_seq;
+        ctx->control_ack->flags = TCP_FLAG_ACK;
+        ctx->control_ack->learned = true;
     }
 
     ctx->learned = true;
 
-    std::printf("[NFQ C-LEARN] learned realBase: client_seq=%u proxy_seq=%u\n", ctx->real_base->client_seq, ctx->real_base->proxy_seq);
-    std::printf("[NFQ C-LEARN] initialized fakeBase: fake_client_seq=%u fake_proxy_seq=%u\n", ctx->fake_base->fake_client_seq, ctx->fake_base->fake_proxy_seq);
+    std::printf("[NFQ C-LEARN] learned from TCP marker packet\n");
+    std::printf("[NFQ C-LEARN] learned realBase: client_seq=%u proxy_seq=%u\n",
+                ctx->real_base->client_seq,
+                ctx->real_base->proxy_seq);
+    std::printf("[NFQ C-LEARN] initialized fakeBase: fake_client_seq=%u fake_proxy_seq=%u\n",
+                ctx->fake_base->fake_client_seq,
+                ctx->fake_base->fake_proxy_seq);
 
     return nfq_set_verdict(qh, packet_id, NF_ACCEPT, 0, nullptr);
 }
 
 
-static bool is_client_learned_keepalive_ack(const ParsedOuterTcpPacket& parsed, const ClientKeepaliveAckFingerprint& learned)
+static bool is_client_allowed_control_ack(const ParsedOuterTcpPacket& parsed, const ClientControlAckState& learned)
 {
     if(!learned.learned)
         return false;
@@ -227,10 +303,10 @@ static bool is_client_learned_keepalive_ack(const ParsedOuterTcpPacket& parsed, 
     if(parsed.ack != learned.ack)
         return false;
 
-    uint32_t proxy_keepalive_probe_seq = learned.seq;
-    uint32_t proxy_normal_ack_seq = learned.seq + 1;
+    uint32_t proxy_normal_ack_seq = learned.seq;
+    uint32_t proxy_keepalive_probe_seq = learned.seq - 1;
 
-    if(parsed.seq != proxy_keepalive_probe_seq && parsed.seq != proxy_normal_ack_seq)
+    if(parsed.seq != proxy_normal_ack_seq && parsed.seq != proxy_keepalive_probe_seq)
         return false;
 
     return true;
@@ -293,7 +369,7 @@ static int client_tunnel_callback(nfq_q_handle* qh, nfgenmsg*, nfq_data* nfad, v
 
     if(parsed.payload_len == 0)
     {
-        if(is_client_learned_keepalive_ack(parsed, ctx->tunnel_state->keepalive_ack))
+        if(is_client_allowed_control_ack(parsed, ctx->tunnel_state->control_ack))
         {
             return nfq_set_verdict(qh, packet_id, NF_ACCEPT, 0, nullptr);
         }
@@ -356,12 +432,12 @@ bool install_client_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_n
     }
 
     std::string cmd =
-        "iptables -I INPUT "
+        "iptables -I OUTPUT "
         "-p tcp "
-        "-s " + proxy_ip + " "
-        "--sport " + std::to_string(config.proxy_port) + " "
-        "-d " + local_ip + " "
-        "--dport " + std::to_string(config.local_port) + " "
+        "-s " + local_ip + " "
+        "--sport " + std::to_string(config.local_port) + " "
+        "-d " + proxy_ip + " "
+        "--dport " + std::to_string(config.proxy_port) + " "
         "-j NFQUEUE --queue-num " + std::to_string(queue_num);
 
     return run_cmd(cmd);
@@ -379,19 +455,19 @@ void cleanup_client_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_n
         return;
 
     std::string cmd =
-        "iptables -D INPUT "
+        "iptables -D OUTPUT "
         "-p tcp "
-        "-s " + proxy_ip + " "
-        "--sport " + std::to_string(config.proxy_port) + " "
-        "-d " + local_ip + " "
-        "--dport " + std::to_string(config.local_port) + " "
+        "-s " + local_ip + " "
+        "--sport " + std::to_string(config.local_port) + " "
+        "-d " + proxy_ip + " "
+        "--dport " + std::to_string(config.proxy_port) + " "
         "-j NFQUEUE --queue-num " + std::to_string(queue_num) +
         " 2>/dev/null";
 
     run_cmd(cmd);
 }
 
-bool learn_client_tcp_base_with_nfqueue( uint16_t queue_num, const ClientRawConfig& config, RealBase& real_base, FakeBase& fake_base, ClientKeepaliveAckFingerprint& keepalive_ack, std::atomic<bool>& stop)
+bool learn_client_tcp_base_with_nfqueue(uint16_t queue_num, int proxy_fd, const ClientRawConfig& config, RealBase& real_base, FakeBase& fake_base, ClientControlAckState& control_ack, std::atomic<bool>& stop)
 {
     nfq_handle* h = nfq_open();
     if(h == nullptr)
@@ -414,13 +490,13 @@ bool learn_client_tcp_base_with_nfqueue( uint16_t queue_num, const ClientRawConf
         return false;
     }
 
-    keepalive_ack = ClientKeepaliveAckFingerprint();
+    control_ack = ClientControlAckState();
 
     ClientNfqueueContext ctx;
     ctx.config = &config;
     ctx.real_base = &real_base;
     ctx.fake_base = &fake_base;
-    ctx.keepalive_ack = &keepalive_ack;
+    ctx.control_ack = &control_ack;
     ctx.learned = false;
 
     nfq_q_handle* qh = nfq_create_queue(h, queue_num, &client_learning_callback, &ctx);
@@ -442,8 +518,19 @@ bool learn_client_tcp_base_with_nfqueue( uint16_t queue_num, const ClientRawConf
     int fd = nfq_fd(h);
     char buf[4096];
 
-    std::printf("[NFQ C-LEARN] waiting for Proxy -> Client keepalive ACK on queue %u...\n",
+    std::printf("[NFQ C-LEARN] waiting for Client -> Proxy TCP learn marker on queue %u...\n",
                 queue_num);
+
+    uint8_t marker = static_cast<uint8_t>(TCP_LEARN_MARKER);
+    if(!send_all(proxy_fd, &marker, 1))
+    {
+        std::fprintf(stderr, "[NFQ C-LEARN] failed to send TCP learn marker\n");
+        nfq_destroy_queue(qh);
+        nfq_close(h);
+        return false;
+    }
+
+    std::printf("[NFQ C-LEARN] sent TCP learn marker\n");
 
     while(!stop.load() && !ctx.learned)
     {
@@ -474,6 +561,9 @@ bool learn_client_tcp_base_with_nfqueue( uint16_t queue_num, const ClientRawConf
             if(errno == EINTR)
                 continue;
 
+            if(errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)
+                continue;
+
             perror("[NFQ C-LEARN] recv");
             break;
         }
@@ -484,9 +574,9 @@ bool learn_client_tcp_base_with_nfqueue( uint16_t queue_num, const ClientRawConf
     nfq_destroy_queue(qh);
     nfq_close(h);
 
-    if(!ctx.learned || !keepalive_ack.learned)
+    if(!ctx.learned || !control_ack.learned)
     {
-        std::fprintf(stderr, "[NFQ C-LEARN] learning failed or stopped\n");
+        std::fprintf(stderr, "[NFQ C-LEARN] marker learning failed or stopped\n");
         return false;
     }
 
@@ -495,15 +585,57 @@ bool learn_client_tcp_base_with_nfqueue( uint16_t queue_num, const ClientRawConf
 
 
 
-
 bool install_client_tunnel_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_num)
 {
-    return install_client_nfqueue_rule(config, queue_num);
+    std::string local_ip;
+    std::string proxy_ip;
+
+    if(!ip_to_string(config.local_ip, local_ip))
+    {
+        std::fprintf(stderr, "failed to convert local ip\n");
+        return false;
+    }
+
+    if(!ip_to_string(config.proxy_ip, proxy_ip))
+    {
+        std::fprintf(stderr, "failed to convert proxy ip\n");
+        return false;
+    }
+
+    std::string cmd =
+        "iptables -I INPUT "
+        "-p tcp "
+        "-s " + proxy_ip + " "
+        "--sport " + std::to_string(config.proxy_port) + " "
+        "-d " + local_ip + " "
+        "--dport " + std::to_string(config.local_port) + " "
+        "-j NFQUEUE --queue-num " + std::to_string(queue_num);
+
+    return run_cmd(cmd);
 }
 
 void cleanup_client_tunnel_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_num)
 {
-    cleanup_client_nfqueue_rule(config, queue_num);
+    std::string local_ip;
+    std::string proxy_ip;
+
+    if(!ip_to_string(config.local_ip, local_ip))
+        return;
+
+    if(!ip_to_string(config.proxy_ip, proxy_ip))
+        return;
+
+    std::string cmd =
+        "iptables -D INPUT "
+        "-p tcp "
+        "-s " + proxy_ip + " "
+        "--sport " + std::to_string(config.proxy_port) + " "
+        "-d " + local_ip + " "
+        "--dport " + std::to_string(config.local_port) + " "
+        "-j NFQUEUE --queue-num " + std::to_string(queue_num) +
+        " 2>/dev/null";
+
+    run_cmd(cmd);
 }
 
 void client_tunnel_nfqueue_loop(uint16_t queue_num, const ClientRawConfig& config, ClientTunnelState& tunnel_state, std::atomic<bool>& stop)

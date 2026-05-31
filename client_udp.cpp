@@ -14,6 +14,7 @@
 
 #define CLIENT_UDP_REGISTER_PREFIX "CUSTOMVPN_CLIENT_UDP_REGISTER_2024350225:"
 #define PROXY_UDP_REGISTER_ACK_PREFIX "CUSTOMVPN_PROXY_UDP_REGISTER_ACK_2024350225:"
+#define PROXY_LEARN_READY_PREFIX "CUSTOMVPN_PROXY_LEARN_READY_2024350225:"
 #define CLIENT_TUNNEL_READY_PREFIX "CUSTOMVPN_CLIENT_TUNNEL_READY_2024350225:"
 #define PROXY_TUNNEL_READY_ACK_PREFIX "CUSTOMVPN_PROXY_TUNNEL_READY_ACK_2024350225:"
 #define CLIENT_START_ACK_PREFIX "CUSTOMVPN_CLIENT_START_ACK_2024350225:"
@@ -156,6 +157,29 @@ static bool is_valid_udp_stop(const std::string& msg, const ClientReadyState& st
     return msg == expected;
 }
 
+static bool is_valid_proxy_learn_ready(const std::string& msg, const ClientReadyState& state)
+{
+    if(!starts_with(msg, PROXY_LEARN_READY_PREFIX))
+        return false;
+
+    std::string client_nonce;
+    std::string proxy_nonce;
+
+    {
+        std::lock_guard<std::mutex> guard(state.lock);
+        client_nonce = state.client_nonce;
+        proxy_nonce = state.proxy_nonce;
+    }
+
+    if(client_nonce.empty() || proxy_nonce.empty())
+        return false;
+
+    std::string body = msg.substr(std::strlen(PROXY_LEARN_READY_PREFIX));
+    std::string expected_body = client_nonce + ":" + proxy_nonce;
+
+    return body == expected_body;
+}
+
 static bool is_valid_proxy_ready_ack(const std::string& msg, const ClientReadyState& state)
 {
     if(!starts_with(msg, PROXY_TUNNEL_READY_ACK_PREFIX))
@@ -264,7 +288,38 @@ bool run_client_udp_register(int udp_fd, const char* proxy_ip, uint16_t ready_po
     return false;
 }
 
+bool wait_for_proxy_learn_ready(ClientReadyState& state, std::atomic<bool>& stop)
+{
+    std::printf("[UDP LEARN] waiting for PROXY_LEARN_READY\n");
 
+    while(!g_signal_stop && !stop.load())
+    {
+        bool proxy_learn_ready_received = false;
+        bool stop_received = false;
+
+        {
+            std::lock_guard<std::mutex> guard(state.lock);
+            proxy_learn_ready_received = state.proxy_learn_ready_received;
+            stop_received = state.stop_received;
+        }
+
+        if(stop_received)
+        {
+            std::fprintf(stderr, "[UDP LEARN] stop received while waiting PROXY_LEARN_READY\n");
+            return false;
+        }
+
+        if(proxy_learn_ready_received)
+        {
+            std::printf("[UDP LEARN] PROXY_LEARN_READY received\n");
+            return true;
+        }
+
+        usleep(10 * 1000);
+    }
+
+    return false;
+}
 
 // 양쪽 tunnel NFQUEUE가 준비됐는지 확인하고, data plane 시작 OK 맞춤
 bool run_client_ready_handshake(int udp_fd, const char* proxy_ip, uint16_t ready_port, ClientReadyState& state, std::atomic<bool>& stop)
@@ -433,6 +488,23 @@ void client_udp_control_loop(int udp_fd, ClientReadyState& state, ClientTunnelSt
             tunnel_state.session_stop.store(true);
             stop.store(true);
             return;
+        }
+
+        if(starts_with(recv_msg, PROXY_LEARN_READY_PREFIX))
+        {
+            if(!is_valid_proxy_learn_ready(recv_msg, state))
+            {
+                std::printf("[UDP CONTROL] ignore PROXY_LEARN_READY with wrong nonce: %s\n", recv_msg.c_str());
+                continue;
+            }
+
+            {
+                std::lock_guard<std::mutex> guard(state.lock);
+                state.proxy_learn_ready_received = true;
+            }
+
+            std::printf("[UDP CONTROL] received valid PROXY_LEARN_READY\n");
+            continue;
         }
 
         if(starts_with(recv_msg, PROXY_TUNNEL_READY_ACK_PREFIX))

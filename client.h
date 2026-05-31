@@ -19,6 +19,7 @@
 #define RAW_OUTER_MAX_LEN (TUN_MTU + OUTER_IP_TCP_HEADER_LEN)
 #define RAW_TTL 64
 #define CLIENT_NFQUEUE_NUM 33
+#define TCP_LEARN_MARKER 'L'
 
 struct ClientRawConfig
 {
@@ -37,11 +38,12 @@ struct ClientReadyState
     bool proxy_ready_ack_received = false;
     bool ready_done = false;
     bool stop_received = false;
+    bool proxy_learn_ready_received = false;
 
     mutable std::mutex lock;
 };
 
-struct ClientKeepaliveAckFingerprint
+struct ClientControlAckState
 {
     uint32_t ip_src = 0;
     uint32_t ip_dst = 0;
@@ -61,7 +63,7 @@ struct ClientTunnelState
     std::atomic<bool> session_stop;
     std::atomic<bool> session_error;
 
-    ClientKeepaliveAckFingerprint keepalive_ack;
+    ClientControlAckState control_ack;
 
     ClientTunnelState()
         : tun_fd(-1),
@@ -143,20 +145,21 @@ bool run_client_ready_handshake(int udp_fd, const char* proxy_ip, uint16_t ready
 void send_client_udp_stop(int udp_fd, const char* proxy_ip, uint16_t ready_port, const ClientReadyState& state);
 bool wait_for_stop_request(std::atomic<bool>& session_stop, std::atomic<bool>& session_error);
 void client_udp_control_loop(int udp_fd, ClientReadyState& state, ClientTunnelState& tunnel_state, std::atomic<bool>& stop);
+bool wait_for_proxy_learn_ready(ClientReadyState& state, std::atomic<bool>& stop);
 
 // raw socket
 bool init_client_raw_config(const char* proxy_ip, uint16_t proxy_port, int proxy_fd, ClientRawConfig& config);
 int open_raw_send_socket();
 void tun_to_raw_loop(int tun_fd, int raw_send_fd, const ClientRawConfig& config, const FakeBase& fake_base, RawSendState& send_state, std::atomic<bool>& stop);
 
-// tcp keepalive & learning
+// tcp control socket & learning
 bool set_tcp_keepalive(int sock, int idle, int interval, int count);
 bool get_socket_local_tuple(int sock, uint32_t& local_ip, uint16_t& local_port);
 
 // learning
 bool install_client_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_num);
 void cleanup_client_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_num);
-bool learn_client_tcp_base_with_nfqueue(uint16_t queue_num, const ClientRawConfig& config, RealBase& real_base, FakeBase& fake_base, ClientKeepaliveAckFingerprint& keepalive_ack, std::atomic<bool>& stop);
+bool learn_client_tcp_base_with_nfqueue(uint16_t queue_num, int proxy_fd, const ClientRawConfig& config, RealBase& real_base, FakeBase& fake_base, ClientControlAckState& control_ack, std::atomic<bool>& stop);
 
 // final nfqueue rule
 bool install_client_tunnel_nfqueue_rule(const ClientRawConfig& config, uint16_t queue_num);
@@ -164,4 +167,4 @@ void cleanup_client_tunnel_nfqueue_rule(const ClientRawConfig& config, uint16_t 
 void client_tunnel_nfqueue_loop(uint16_t queue_num, const ClientRawConfig& config, ClientTunnelState& tunnel_state, std::atomic<bool>& stop);
 
 #endif
-// CLINET_H
+// CLIENT_H
